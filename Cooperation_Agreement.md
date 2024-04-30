@@ -1,5 +1,4 @@
 Agreement Contract for project: Classifier Guided Diffusion For Point Clouds
-Last edit 13.03.24
 
 ### Meetings:
 A) Time and Place:
@@ -16,15 +15,13 @@ C)
 Notes from the meetings will be added to the logbook.md file after every meeting. The logbook is loacted on Git so all members have 24/7 access to it. 
 
 D)
-Initially, Henrik has been assigned the responsibility of recording meeting logs and communicating with our course leaders via email.
+The responsibility of recording meeting logs and communicating with our course leaders, will be shared.
 
 E)
 We will first attempt to resolve issues through discussion. If a solution is not found, we will consult the guidance counselor.
 
 ### Communication in the Group:
 A) We'll use Discord and PLANE for all communication.
-
-B) We agreed to listen to everyone in the group.
 
 ### Workload, Expectations, and Ownership:
 A) We acknowledge that achieving perfect equality in workload distribution may not be possible.
