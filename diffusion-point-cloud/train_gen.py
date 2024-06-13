@@ -12,10 +12,10 @@ from utils.misc import *
 from utils.data import *
 from models.vae_gaussian import *
 from models.vae_flow import *
-from models.flow import add_spectral_norm, spectral_norm_power_iteration
+from models.vae_pointnet import *
 from models.pointnet import *
+from models.flow import add_spectral_norm, spectral_norm_power_iteration
 from evaluation import *
-
 
 # Arguments
 parser = argparse.ArgumentParser()
@@ -56,7 +56,7 @@ parser.add_argument('--seed', type=int, default=2020)
 parser.add_argument('--logging', type=eval, default=True, choices=[True, False])
 parser.add_argument('--log_root', type=str, default='./logs_gen')
 parser.add_argument('--device', type=str, default='cuda')
-parser.add_argument('--max_iters', type=int, default=1000)
+parser.add_argument('--max_iters', type=int, default=50000) # Change this to however many iterations you want to run.
 parser.add_argument('--val_freq', type=int, default=1000)
 parser.add_argument('--test_freq', type=int, default=30*THOUSAND)
 parser.add_argument('--test_size', type=int, default=400)
@@ -105,8 +105,7 @@ if args.model == 'gaussian':
 elif args.model == 'flow':
     model = FlowVAE(args).to(args.device)
 elif args.model == 'pointnet':
-    model = get_model(k=55, normal_channel=True).to(args.device)
-    model.get_loss = get_loss()
+    model = PointNetVAE(args).to(args.device)
 logger.info(repr(model))
 if args.spectral_norm:
     add_spectral_norm(model, logger=logger)
@@ -138,10 +137,7 @@ def train(it):
 
     # Forward
     kl_weight = args.kl_weight
-    if args.model != 'pointnet':
-        loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
-    else:
-        loss = model.get_loss()
+    loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
 
     # Backward and optimize
     loss.backward()

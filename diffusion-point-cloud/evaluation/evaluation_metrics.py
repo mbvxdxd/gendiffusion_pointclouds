@@ -9,8 +9,9 @@ from sklearn.neighbors import NearestNeighbors
 from numpy.linalg import norm
 from tqdm.auto import tqdm
 
-
 _EMD_NOT_IMPL_WARNED = False
+
+
 def emd_approx(sample, ref):
     global _EMD_NOT_IMPL_WARNED
     emd = torch.zeros([sample.size(0)]).to(sample)
