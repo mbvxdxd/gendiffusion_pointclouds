@@ -13,13 +13,14 @@ from utils.data import *
 from models.vae_gaussian import *
 from models.vae_flow import *
 from models.flow import add_spectral_norm, spectral_norm_power_iteration
+from models.pointnet import *
 from evaluation import *
 
 
 # Arguments
 parser = argparse.ArgumentParser()
 # Model arguments
-parser.add_argument('--model', type=str, default='flow', choices=['flow', 'gaussian'])
+parser.add_argument('--model', type=str, default='pointnet', choices=['flow', 'gaussian', 'pointnet'])
 parser.add_argument('--latent_dim', type=int, default=256)
 parser.add_argument('--num_steps', type=int, default=100)
 parser.add_argument('--beta_1', type=float, default=1e-4)
@@ -37,7 +38,7 @@ parser.add_argument('--spectral_norm', type=eval, default=False, choices=[True, 
 
 # Datasets and loaders
 parser.add_argument('--dataset_path', type=str, default='./data/shapenet.hdf5')
-parser.add_argument('--categories', type=str_list, default=['airplane'])
+parser.add_argument('--categories', type=str_list, default=['all'])
 parser.add_argument('--scale_mode', type=str, default='shape_unit')
 parser.add_argument('--train_batch_size', type=int, default=128)
 parser.add_argument('--val_batch_size', type=int, default=64)
@@ -55,7 +56,7 @@ parser.add_argument('--seed', type=int, default=2020)
 parser.add_argument('--logging', type=eval, default=True, choices=[True, False])
 parser.add_argument('--log_root', type=str, default='./logs_gen')
 parser.add_argument('--device', type=str, default='cuda')
-parser.add_argument('--max_iters', type=int, default=float('inf'))
+parser.add_argument('--max_iters', type=int, default=1000)
 parser.add_argument('--val_freq', type=int, default=1000)
 parser.add_argument('--test_freq', type=int, default=30*THOUSAND)
 parser.add_argument('--test_size', type=int, default=400)
@@ -103,6 +104,9 @@ if args.model == 'gaussian':
     model = GaussianVAE(args).to(args.device)
 elif args.model == 'flow':
     model = FlowVAE(args).to(args.device)
+elif args.model == 'pointnet':
+    model = get_model(k=55, normal_channel=True).to(args.device)
+    model.get_loss = get_loss()
 logger.info(repr(model))
 if args.spectral_norm:
     add_spectral_norm(model, logger=logger)
@@ -134,7 +138,10 @@ def train(it):
 
     # Forward
     kl_weight = args.kl_weight
-    loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
+    if args.model != 'pointnet':
+        loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
+    else:
+        loss = model.get_loss()
 
     # Backward and optimize
     loss.backward()
