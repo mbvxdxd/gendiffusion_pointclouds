@@ -1,57 +1,165 @@
 import torch
 import torch.nn as nn
+import torch.nn.parallel
+import torch.utils.data
 import torch.nn.functional as F
-from .pointnet import *
-from .common import *
-from .diffusion import *
+from .encoders import *
 
-class PointNetVAE(nn.Module):
-    def __init__(self, args):
-        super(PointNetVAE, self).__init__()
-        self.args = args
-        self.encoder = PointNetEncoder(args.latent_dim)
-        self.diffusion = DiffusionPoint(
-            net=PointwiseNet(point_dim=3, context_dim=args.latent_dim, residual=args.residual),
-            var_sched=VarianceSchedule(
-                num_steps=args.num_steps,
-                beta_1=args.beta_1,
-                beta_T=args.beta_T,
-                mode=args.sched_mode
-            )
-        )
+class STN3d(nn.Module):
+    def __init__(self):
+        super(STN3d, self).__init__()
+        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, 1024, 1)
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 9)
+        self.relu = nn.ReLU()
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
 
-    def get_loss(self, x, writer=None, it=None, kl_weight=1.0):
-        batch_size, _, _ = x.size()
-        z_mu, z_sigma = self.encoder(x)
-        z = reparameterize_gaussian(mean=z_mu, logvar=z_sigma)
-        log_pz = standard_normal_logprob(z).sum(dim=1)
-        entropy = gaussian_entropy(logvar=z_sigma)
-        loss_prior = (- log_pz - entropy).mean()
-        loss_recons = self.diffusion.get_loss(x, z)
-        loss = kl_weight * loss_prior + loss_recons
+        self.iden = torch.tensor([1,0,0,0,1,0,0,0,1], dtype=torch.float32).view(1, 9)
 
-        if writer is not None:
-            writer.add_scalar('train/loss_entropy', -entropy.mean(), it)
-            writer.add_scalar('train/loss_prior', -log_pz.mean(), it)
-            writer.add_scalar('train/loss_recons', loss_recons, it)
+    def forward(self, x):
+        batchsize = x.size()[0]
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = torch.max(x, 2, keepdim=True)[0]
+        x = x.view(-1, 1024)
 
-        return loss
+        x = F.relu(self.bn4(self.fc1(x)))
+        x = F.relu(self.bn5(self.fc2(x)))
+        x = self.fc3(x)
 
-    def sample(self, z, num_points, flexibility, truncate_std=None):
-        if truncate_std is not None:
-            z = truncated_normal_(z, mean=0, std=1, trunc_std=truncate_std)
-        samples = self.diffusion.sample(num_points, context=z, flexibility=flexibility)
-        return samples
+        x = x.view(-1, 3, 3)
+        x = x + self.iden
+        return x
 
-if __name__ == "__main__":
-    class Args:
-        latent_dim = 256
-        residual = True
-        num_steps = 1000
-        beta_1 = 0.1
-        beta_T = 20.0
-        sched_mode = 'linear'
+class STNkd(nn.Module):
+    def __init__(self, k=64):
+        super(STNkd, self).__init__()
+        self.conv1 = nn.Conv1d(k, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, 1024, 1)
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, k*k)
+        self.relu = nn.ReLU()
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
 
-    args = Args()
-    model = PointNetVAE(args)
-    print(model)
+        self.iden = torch.eye(k, dtype=torch.float32).view(1, k*k)
+
+    def forward(self, x):
+        batchsize = x.size()[0]
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = torch.max(x, 2, keepdim=True)[0]
+        x = x.view(-1, 1024)
+
+        x = F.relu(self.bn4(self.fc1(x)))
+        x = F.relu(self.bn5(self.fc2(x)))
+        x = self.fc3(x)
+
+        x = x.view(-1, x.size(1), x.size(1))
+        x = x + self.iden
+        return x
+
+class PointNetfeat(nn.Module):
+    def __init__(self, global_feat = True, feature_transform = False):
+        super(PointNetfeat, self).__init__()
+        self.stn = STN3d()
+        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, 1024, 1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.global_feat = global_feat
+        self.feature_transform = feature_transform
+        if self.feature_transform:
+            self.fstn = STNkd(k=64)
+
+    def forward(self, x):
+        n_pts = x.size()[2]
+        trans = self.stn(x)
+        x = x.transpose(2, 1)
+        x = torch.bmm(x, trans)
+        x = x.transpose(2, 1)
+        x = F.relu(self.bn1(self.conv1(x)))
+
+        if self.feature_transform:
+            trans_feat = self.fstn(x)
+            x = x.transpose(2,1)
+            x = torch.bmm(x, trans_feat)
+            x = x.transpose(2,1)
+        else:
+            trans_feat = None
+        
+        pointfeat = x
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.bn3(self.conv3(x))
+        x = torch.max(x, 2, keepdim=True)[0]
+        x = x.view(-1, 1024)
+        if self.global_feat:
+            return x, trans, trans_feat
+        else:
+            x = x.view(-1, 1024, 1).repeat(1, 1, n_pts)
+            return torch.cat([x, pointfeat], 1), trans, trans_feat
+        
+class PointNetCls(nn.Module):
+    def __init__(self, k=2, feature_transform=False):
+        super(PointNetCls, self).__init__()
+        self.feature_transform = feature_transform
+        self.feat = PointNetfeat(global_feat=True, feature_transform=feature_transform)
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, k)
+        self.dropout = nn.Dropout(p=0.3)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x, trans, trans_feat = self.feat(x)
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = F.relu(self.bn2(self.dropout(self.fc2(x))))
+        x = self.fc3(x)
+        return F.log_softmax(x, dim=1), trans, trans_feat
+
+
+class PointNetDenseCls(nn.Module):
+    def __init__(self, k = 2, feature_transform=False):
+        super(PointNetDenseCls, self).__init__()
+        self.k = k
+        self.feature_transform=feature_transform
+        self.feat = PointNetfeat(global_feat=False, feature_transform=feature_transform)
+        self.conv1 = torch.nn.Conv1d(1088, 512, 1)
+        self.conv2 = torch.nn.Conv1d(512, 256, 1)
+        self.conv3 = torch.nn.Conv1d(256, 128, 1)
+        self.conv4 = torch.nn.Conv1d(128, self.k, 1)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.bn3 = nn.BatchNorm1d(128)
+
+    def forward(self, x):
+        batchsize = x.size()[0]
+        n_pts = x.size()[2]
+        x, trans, trans_feat = self.feat(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.conv4(x)
+        x = x.transpose(2,1).contiguous()
+        x = F.log_softmax(x.view(-1,self.k), dim=-1)
+        x = x.view(batchsize, n_pts, self.k)
+        return x, trans, trans_feat
+
