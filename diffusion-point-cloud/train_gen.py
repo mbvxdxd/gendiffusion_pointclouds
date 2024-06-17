@@ -1,4 +1,5 @@
 import os
+import sys
 import math
 import argparse
 import torch
@@ -16,6 +17,12 @@ from models.vae_pointnet import *
 from models.pointnet import *
 from models.flow import add_spectral_norm, spectral_norm_power_iteration
 from evaluation import *
+import provider
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = BASE_DIR
+sys.path.append(os.path.join(ROOT_DIR, 'models'))
+
 
 # Arguments
 parser = argparse.ArgumentParser()
@@ -37,6 +44,8 @@ parser.add_argument('--sample_num_points', type=int, default=2048)
 parser.add_argument('--kl_weight', type=float, default=0.001)
 parser.add_argument('--residual', type=eval, default=True, choices=[True, False])
 parser.add_argument('--spectral_norm', type=eval, default=False, choices=[True, False])
+parser.add_argument('--normal_channel', type=eval, default=False, choices=[True, False])
+parser.add_argument('--k', type=int, default=55)
 
 # Datasets and loaders
 parser.add_argument('--dataset_path', type=str, default='./data/shapenet.hdf5')
@@ -44,6 +53,7 @@ parser.add_argument('--categories', type=str_list, default=['all'])
 parser.add_argument('--scale_mode', type=str, default='shape_unit')
 parser.add_argument('--train_batch_size', type=int, default=128)
 parser.add_argument('--val_batch_size', type=int, default=64)
+parser.add_argument('--workers', type=int, default=0)
 
 # Optimizer and scheduler
 parser.add_argument('--lr', type=float, default=2e-3)
@@ -99,6 +109,7 @@ train_iter = get_data_iterator(DataLoader(
     batch_size=args.train_batch_size,
     num_workers=0,
 ))
+print(train_iter)
 num_classes = len(train_dset.cate_synsetids)
 print('Number of classes:', num_classes)
 # Model
@@ -108,7 +119,7 @@ if args.model == 'gaussian':
 elif args.model == 'flow':
     model = FlowVAE(args).to(args.device)
 elif args.model == 'pointnet':
-    model = PointNetCls(k=num_classes, feature_transform=args.feature_transform).to(args.device)
+    model = PointNetCls(args).to(args.device)
 logger.info(repr(model))
 if args.spectral_norm:
     add_spectral_norm(model, logger=logger)
@@ -116,7 +127,9 @@ if args.spectral_norm:
 # Optimizer and scheduler
 optimizer = torch.optim.Adam(model.parameters(), 
     lr=args.lr, 
-    weight_decay=args.weight_decay
+    weight_decay=args.weight_decay,
+    betas=(0.9, 0.999),
+    eps=1e-8
 )
 scheduler = get_linear_scheduler(
     optimizer,
@@ -140,34 +153,24 @@ def train(it):
 
     # Forward
     kl_weight = args.kl_weight
-    if args.model != 'pointnet':
+    if args.model == 'pointnet':
         loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
     else:
-        recon_x, mu, logvar = model(x)
-        loss, recon_loss, kld_loss = model.loss_function(recon_x, x, mu, logvar)
-        loss = F.nll_loss(output, target)
+        loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
+
     # Backward and optimize
     loss.backward()
     orig_grad_norm = clip_grad_norm_(model.parameters(), args.max_grad_norm)
     optimizer.step()
     scheduler.step()
 
-    if args.model != 'pointnet':       
-        writer.add_scalar('train/loss', loss, it)
-        writer.add_scalar('train/kl_weight', kl_weight, it)
-        writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
-        writer.add_scalar('train/grad_norm', orig_grad_norm, it)
-        logger.info('[Train] Iter %04d | Loss %.6f | Grad %.4f | KLWeight %.4f' % (
-            it, loss.item(), orig_grad_norm, kl_weight
-        ))
-    else:
-        logger.info('[Train] Iter %04d | Loss %.6f | Recon Loss %.6f | KLD Loss %.6f' % (
-            it, loss.item(), recon_loss.item(), kld_loss.item()
-        ))
-        writer.add_scalar('train/loss', loss.item(), it)
-        writer.add_scalar('train/recon_loss', recon_loss.item(), it)
-        writer.add_scalar('train/kld_loss', kld_loss.item(), it)
-        writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
+    
+    writer.add_scalar('train/loss', loss, it)
+    writer.add_scalar('train/kl_weight', kl_weight, it)
+    writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
+    writer.add_scalar('train/grad_norm', orig_grad_norm, it)
+    logger.info('[Train] Iter %04d | Loss %.6f | Grad %.4f | KLWeight %.4f' % (it, loss.item(), orig_grad_norm, kl_weight))
+
     writer.flush()
 
 def validate_inspect(it):
