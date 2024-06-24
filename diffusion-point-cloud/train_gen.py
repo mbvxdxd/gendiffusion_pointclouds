@@ -17,8 +17,8 @@ from models.vae_pointnet import *
 from models.pointnet import *
 from models.flow import add_spectral_norm, spectral_norm_power_iteration
 from evaluation import *
-import provider
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1' # for debugging
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
@@ -45,11 +45,13 @@ parser.add_argument('--kl_weight', type=float, default=0.001)
 parser.add_argument('--residual', type=eval, default=True, choices=[True, False])
 parser.add_argument('--spectral_norm', type=eval, default=False, choices=[True, False])
 parser.add_argument('--normal_channel', type=eval, default=False, choices=[True, False])
-parser.add_argument('--k', type=int, default=55)
+parser.add_argument('--k', type=int, default=2)
+parser.add_argument('--num_classes', type=int, default=2)
+parser.add_argument('--guidance_loss_weight', type=float, default=1)
 
 # Datasets and loaders
 parser.add_argument('--dataset_path', type=str, default='./data/shapenet.hdf5')
-parser.add_argument('--categories', type=str_list, default=['all'])
+parser.add_argument('--categories', type=str_list, default=['airplane', 'chair'])
 parser.add_argument('--scale_mode', type=str, default='shape_unit')
 parser.add_argument('--train_batch_size', type=int, default=128)
 parser.add_argument('--val_batch_size', type=int, default=64)
@@ -68,9 +70,9 @@ parser.add_argument('--seed', type=int, default=2020)
 parser.add_argument('--logging', type=eval, default=True, choices=[True, False])
 parser.add_argument('--log_root', type=str, default='./logs_gen')
 parser.add_argument('--device', type=str, default='cuda')
-parser.add_argument('--max_iters', type=int, default=50000) # Change this to however many iterations you want to run.
+parser.add_argument('--max_iters', type=int, default=500000) # Change this to however many iterations you want to run.
 parser.add_argument('--val_freq', type=int, default=1000)
-parser.add_argument('--test_freq', type=int, default=30*THOUSAND)
+parser.add_argument('--test_freq', type=int, default=5*THOUSAND)
 parser.add_argument('--test_size', type=int, default=400)
 parser.add_argument('--tag', type=str, default=None)
 args = parser.parse_args()
@@ -109,9 +111,15 @@ train_iter = get_data_iterator(DataLoader(
     batch_size=args.train_batch_size,
     num_workers=0,
 ))
-print(train_iter)
 num_classes = len(train_dset.cate_synsetids)
 print('Number of classes:', num_classes)
+
+# PointNet classifier
+#logger.info('Loading PointNet classifier...')
+pointnet_classifier = PointNet(args).to(args.device)
+#pointnet_classifier.load_state_dict(torch.load('./pretrained/ckpt_0.000000_500000.pt'), strict=False)
+#pointnet_classifier.eval()
+
 # Model
 logger.info('Building model...')
 if args.model == 'gaussian':
@@ -119,7 +127,7 @@ if args.model == 'gaussian':
 elif args.model == 'flow':
     model = FlowVAE(args).to(args.device)
 elif args.model == 'pointnet':
-    model = PointNetCls(args).to(args.device)
+    model = GuidedGaussianVAE(args).to(args.device)
 logger.info(repr(model))
 if args.spectral_norm:
     add_spectral_norm(model, logger=logger)
@@ -138,40 +146,51 @@ scheduler = get_linear_scheduler(
     start_lr=args.lr,
     end_lr=args.end_lr
 )
-
+cates = {
+    'airplane': 0,
+    'chair': 1
+}
+alpha = 0.5
 # Train, validate and test
 def train(it):
-    # Load data
-    batch = next(train_iter)
-    x = batch['pointcloud'].to(args.device)
+    try:
+        # Load data
+        batch = next(train_iter)
+        x = batch['pointcloud'].to(args.device)
+        y = batch['label'].to(args.device)
 
-    # Reset grad and model state
-    optimizer.zero_grad()
-    model.train()
-    if args.spectral_norm:
-        spectral_norm_power_iteration(model, n_power_iterations=1)
+        # Reset grad and model state
+        optimizer.zero_grad()
+        model.train()
+        if args.spectral_norm:
+            spectral_norm_power_iteration(model, n_power_iterations=1)
 
-    # Forward
-    kl_weight = args.kl_weight
-    if args.model == 'pointnet':
-        loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
-    else:
-        loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
+        # Forward
+        kl_weight = args.kl_weight
+        if args.model == 'pointnet':
+            preds, _, A = pointnet_classifier(x.transpose(2, 1))
+            loss = model.get_loss(x=preds, labels=y, A=A, writer=writer, it=it)
+        else:
+            loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
 
-    # Backward and optimize
-    loss.backward()
-    orig_grad_norm = clip_grad_norm_(model.parameters(), args.max_grad_norm)
-    optimizer.step()
-    scheduler.step()
+        # Backward and optimize
+        loss.backward()
+        orig_grad_norm = clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
 
-    
-    writer.add_scalar('train/loss', loss, it)
-    writer.add_scalar('train/kl_weight', kl_weight, it)
-    writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
-    writer.add_scalar('train/grad_norm', orig_grad_norm, it)
-    logger.info('[Train] Iter %04d | Loss %.6f | Grad %.4f | KLWeight %.4f' % (it, loss.item(), orig_grad_norm, kl_weight))
+        # Logging
+        writer.add_scalar('train/loss', loss, it)
+        writer.add_scalar('train/kl_weight', kl_weight, it)
+        writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], it)
+        writer.add_scalar('train/grad_norm', orig_grad_norm, it)
+        logger.info('[Train] Iter %04d | Loss %.6f | Grad %.4f | KLWeight %.4f' % (it, loss.item(), orig_grad_norm, kl_weight))
 
-    writer.flush()
+        writer.flush()
+
+    except Exception as e:
+        logger.error(f"An error occurred at iteration {it}: {str(e)}")
+        raise
 
 def validate_inspect(it):
     z = torch.randn([args.num_samples, args.latent_dim]).to(args.device)

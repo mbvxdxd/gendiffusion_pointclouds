@@ -10,6 +10,8 @@ from utils.misc import *
 from utils.data import *
 from models.vae_gaussian import *
 from models.vae_flow import *
+from models.vae_pointnet import *
+from models.pointnet import *
 from models.flow import add_spectral_norm, spectral_norm_power_iteration
 from evaluation import *
 
@@ -35,8 +37,8 @@ def normalize_point_clouds(pcs, mode, logger):
 
 # Arguments
 parser = argparse.ArgumentParser()
-parser.add_argument('--ckpt', type=str, default='./pretrained/ckpt_0.000000_50000.pt')
-parser.add_argument('--categories', type=str_list, default=['all'])
+parser.add_argument('--ckpt', type=str, default='./pretrained/ckpt_0.000000_1000.pt')
+parser.add_argument('--categories', type=str_list, default=['airplane', 'chair'])
 parser.add_argument('--save_dir', type=str, default='./results')
 parser.add_argument('--device', type=str, default='cuda')
 # Datasets and loaders
@@ -77,6 +79,8 @@ if ckpt['args'].model == 'gaussian':
     model = GaussianVAE(ckpt['args']).to(args.device)
 elif ckpt['args'].model == 'flow':
     model = FlowVAE(ckpt['args']).to(args.device)
+elif ckpt['args'].model == 'pointnet':
+    model = PointNetVAE(ckpt['args']).to(args.device)
 logger.info(repr(model))
 # if ckpt['args'].spectral_norm:
 #     add_spectral_norm(model, logger=logger)
