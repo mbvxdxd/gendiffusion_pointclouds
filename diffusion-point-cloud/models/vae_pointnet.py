@@ -1,129 +1,98 @@
 import torch
-import torch.nn as nn
-import torch.nn.parallel
-import torch.utils.data
-from torch.autograd import Variable
-import numpy as np
-import torch.nn.functional as F
+from torch.nn import Module
+from .common import *
+from .encoders import *
+from .diffusion import *
+from .pointnet import *
 
-class STN3d(nn.Module):
-    def __init__(self, k):
-        super(STN3d, self).__init__()
-        self.conv1 = nn.Conv1d(k, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, 1024, 1)
-        self.fc1 = nn.Linear(1024, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, 9)
-        self.relu = nn.ReLU()
+class PointNetVAE(Module):
 
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
-        self.bn4 = nn.BatchNorm1d(512)
-        self.bn5 = nn.BatchNorm1d(256)
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.encoder = PointNetEncoder(args.latent_dim)
+        self.diffusion = DiffusionPoint(
+            net=PointwiseNet(point_dim=3, context_dim=args.latent_dim, residual=args.residual),
+            var_sched=VarianceSchedule(
+                num_steps=args.num_steps,
+                beta_1=args.beta_1,
+                beta_T=args.beta_T,
+                mode=args.sched_mode
+            )
+        )
+        self.pointnet_classifier = PointNet(k=args.k, feature_transform=args.feature_transform)
 
-    def forward(self, x):
-        batchsize = x.size()[0]
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = torch.max(x, 2, keepdim=True)[0]
-        x = x.view(-1, 1024)
+    def get_loss(self, x, y, writer=None, it=None, kl_weight=1.0):
+        """
+        Args:
+            x:  Input point clouds, (B, N, d).
+            y:  Target class labels, (B, ).
+        """
+        # Forward pass through encoder
+        z_mu, z_sigma = self.encoder(x)
+        z = reparameterize_gaussian(mean=z_mu, logvar=z_sigma)  # (B, F)
 
-        x = F.relu(self.bn4(self.fc1(x)))
-        x = F.relu(self.bn5(self.fc2(x)))
-        x = self.fc3(x)
+        # Reconstruction loss
+        recon_loss = self.diffusion.get_loss(x, z)
+        
+        # KL divergence loss
+        kl_loss = -0.5 * torch.sum(1 + z_sigma - z_mu.pow(2) - z_sigma.exp()) / x.size(0)
+        
+        # Forward pass through classifier
+        pred, _, _ = self.pointnet_classifier(x)
+        # Classification loss
+        # target should be of shape (B, 2)
+        # since x is of shape (B, N, d), target should be of shape (B, N)
+        target = y
+        #print(target)
+        #print(pred)
+        classification_loss = F.cross_entropy(pred, target)
+        
+        # Combined loss
+        loss = recon_loss + kl_weight * kl_loss + classification_loss
+        
+        # Log the losses if writer is provided
+        if writer is not None and it is not None:
+            writer.add_scalar('Loss/recon_loss', recon_loss.item(), it)
+            writer.add_scalar('Loss/kl_loss', kl_loss.item(), it)
+            writer.add_scalar('Loss/classification_loss', classification_loss.item(), it)
+            writer.add_scalar('Loss/total_loss', loss.item(), it)
+        
+        return loss
 
-        iden = Variable(torch.from_numpy(np.array([1,0,0,0,1,0,0,0,1]).astype(np.float32))).view(1,9).repeat(batchsize,1).cuda()
+    def sample(self, z, num_points, flexibility, truncate_std=None, target_class=None):
+        """
+        Args:
+            z:  Input latent, normal random samples with mean=0 std=1, (B, F)
+            target_class: Desired class label for guidance.
+        """
+        if truncate_std is not None:
+            z = truncated_normal_(z, mean=0, std=1, trunc_std=truncate_std)
 
-        x = x + iden
-        x = x.view(-1, 3, 3)
-        return x
+        samples = self.diffusion.sample(num_points, context=z, flexibility=flexibility)
 
-class STNkd(nn.Module):
-    def __init__(self, k=64):
-        super(STNkd, self).__init__()
-        self.conv1 = nn.Conv1d(k, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, 1024, 1)
-        self.fc1 = nn.Linear(1024, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, k*k)
-        self.relu = nn.ReLU()
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
-        self.bn4 = nn.BatchNorm1d(512)
-        self.bn5 = nn.BatchNorm1d(256)
+        if target_class is not None:
+            samples = self.guided_sampling(samples, target_class)
 
-        self.k = k
+        return samples
 
-    def forward(self, x):
-        batchsize = x.size()[0]
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = torch.max(x, 2, keepdim=True)[0]
-        x = x.view(-1, 1024)
+    def guided_sampling(self, samples, target_class, num_guidance_steps=5, guidance_scale=1):
+        """
+        Args:
+            samples: Initial samples from the diffusion process, (B, N, d).
+            target_class: Desired class label for guidance.
+            num_guidance_steps: Number of guidance steps to apply.
+            guidance_scale: Scale factor for the guidance adjustments.
+        """
+        samples.requires_grad_(True)
 
-        x = F.relu(self.bn4(self.fc1(x)))
-        x = F.relu(self.bn5(self.fc2(x)))
-        x = self.fc3(x)
+        for _ in range(num_guidance_steps):
+            logits, _, _ = self.pointnet_classifier(samples)
+            loss = torch.nn.CrossEntropyLoss()(logits, target_class)
+            loss.backward()
 
-        iden = Variable(torch.from_numpy(np.eye(self.k).flatten().astype(np.float32))).view(1, self.k*self.k).repeat(batchsize,1)
-        x = x + self.iden
-        x = x.view(-1, self.k, self.k)
-        return x
+            with torch.no_grad():
+                samples = samples - guidance_scale * samples.grad
+                samples.grad.zero_()
 
-class PointNetfeat(nn.Module):
-    def __init__(self, global_feat = True, feature_transform = False, channel=3):
-        super(PointNetfeat, self).__init__()
-        self.stn = STN3d(channel)
-        self.conv1 = nn.Conv1d(channel, 64, 1)
-        self.conv2 = nn.Conv1d(64, 128, 1)
-        self.conv3 = nn.Conv1d(128, 1024, 1)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
-        self.global_feat = global_feat
-        self.feature_transform = feature_transform
-        if self.feature_transform:
-            self.fstn = STN3d(k=64)
-
-    def forward(self, x):
-        batchsize = x.size()[0]
-        n_pts = x.size()[2]
-        trans = self.stn(x)
-        x = x.transpose(2, 1)
-        x = torch.bmm(x, trans)
-        x = x.transpose(2, 1)
-        x = F.relu(self.bn1(self.conv1(x)))
-
-        if self.feature_transform:
-            trans_feat = self.fstn(x)
-            x = x.transpose(2, 1)
-            x = torch.bmm(x, trans_feat)
-            x = x.transpose(2, 1)
-        else:
-            trans_feat = None
-
-        pointfeat = x
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.bn3(self.conv3(x))
-        x = torch.max(x, 2, keepdim=True)[0]
-        x = x.view(-1, 1024)
-        if self.global_feat:
-            return x, trans_feat
-        else:
-            x = x.view(-1, 1024, 1).repeat(1, 1, n_pts)
-            return torch.cat([x, pointfeat], 1), trans_feat
-
-def feature_transform_reguliarzer(trans):
-    d = trans.size()[1]
-    I = torch.eye(d)[None, :, :]
-    if trans.is_cuda:
-        I = I.cuda()
-    loss = torch.mean(torch.norm(torch.bmm(trans, trans.transpose(2, 1)) - I, dim=(1, 2)))
-    return loss
-
+        return samples.detach()

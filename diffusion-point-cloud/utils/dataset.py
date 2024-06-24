@@ -7,13 +7,12 @@ import numpy as np
 import h5py
 from tqdm.auto import tqdm
 
-
 synsetid_to_cate = {
-    '02691156': 'airplane', '02773838': 'bag', '02801938': 'basket',
+    '02691156': 'airplane', '03001627': 'chair', '02773838': 'bag', '02801938': 'basket',
     '02808440': 'bathtub', '02818832': 'bed', '02828884': 'bench',
     '02876657': 'bottle', '02880940': 'bowl', '02924116': 'bus',
     '02933112': 'cabinet', '02747177': 'can', '02942699': 'camera',
-    '02954340': 'cap', '02958343': 'car', '03001627': 'chair',
+    '02954340': 'cap', '02958343': 'car',
     '03046257': 'clock', '03207941': 'dishwasher', '03211117': 'monitor',
     '04379243': 'table', '04401088': 'telephone', '02946921': 'tin_can',
     '04460130': 'tower', '04468005': 'train', '03085013': 'keyboard',
@@ -28,10 +27,10 @@ synsetid_to_cate = {
     '04256520': 'sofa', '04330267': 'stove', '04530566': 'vessel',
     '04554684': 'washer', '02992529': 'cellphone',
     '02843684': 'birdhouse', '02871439': 'bookshelf',
-    # '02858304': 'boat', no boat in our dataset, merged into vessels
-    # '02834778': 'bicycle', not in our taxonomy
 }
+
 cate_to_synsetid = {v: k for k, v in synsetid_to_cate.items()}
+cate_to_label = {cate: idx for idx, cate in enumerate(cate_to_synsetid.keys())}  # Add a mapping from category to label
 
 
 class ShapeNetCore(Dataset):
@@ -121,13 +120,15 @@ class ShapeNetCore(Dataset):
                     scale = torch.ones([1, 1])
 
                 pc = (pc - shift) / scale
+                label = cate_to_label[cate_name]
 
                 self.pointclouds.append({
                     'pointcloud': pc,
                     'cate': cate_name,
                     'id': pc_id,
                     'shift': shift,
-                    'scale': scale
+                    'scale': scale,
+                    'label': label
                 })
 
         # Deterministically shuffle the dataset
@@ -138,8 +139,7 @@ class ShapeNetCore(Dataset):
         return len(self.pointclouds)
 
     def __getitem__(self, idx):
-        data = {k:v.clone() if isinstance(v, torch.Tensor) else copy(v) for k, v in self.pointclouds[idx].items()}
+        data = {k: v.clone() if isinstance(v, torch.Tensor) else copy(v) for k, v in self.pointclouds[idx].items()}
         if self.transform is not None:
             data = self.transform(data)
         return data
-

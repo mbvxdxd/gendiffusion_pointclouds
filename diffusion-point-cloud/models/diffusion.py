@@ -4,7 +4,7 @@ from torch.nn import Module, Parameter, ModuleList
 import numpy as np
 
 from .common import *
-
+from .pointnet import *
 
 class VarianceSchedule(Module):
 
@@ -92,33 +92,61 @@ class PointwiseNet(Module):
 
 class DiffusionPoint(Module):
 
-    def __init__(self, net, var_sched:VarianceSchedule):
+    def __init__(self, net, var_sched: VarianceSchedule):
         super().__init__()
         self.net = net
         self.var_sched = var_sched
 
-    def get_loss(self, x_0, context, t=None):
+    def get_loss(self, x_0, context, t=None, pointnet=None, guidance_weight=1):
         """
         Args:
             x_0:  Input point cloud, (B, N, d).
             context:  Shape latent, (B, F).
         """
         batch_size, _, point_dim = x_0.size()
-        if t == None:
+        if t is None:
             t = self.var_sched.uniform_sample_t(batch_size)
         alpha_bar = self.var_sched.alpha_bars[t]
         beta = self.var_sched.betas[t]
 
-        c0 = torch.sqrt(alpha_bar).view(-1, 1, 1)       # (B, 1, 1)
-        c1 = torch.sqrt(1 - alpha_bar).view(-1, 1, 1)   # (B, 1, 1)
+        c0 = torch.sqrt(alpha_bar).view(-1, 1, 1)
+        c1 = torch.sqrt(1 - alpha_bar).view(-1, 1, 1)
 
-        e_rand = torch.randn_like(x_0)  # (B, N, d)
-        e_theta = self.net(c0 * x_0 + c1 * e_rand, beta=beta, context=context)
+        e_rand = torch.randn_like(x_0)
+        x_diffused = c0 * x_0 + c1 * e_rand
+        e_theta = self.net(x_diffused, beta=beta, context=context)
 
         loss = F.mse_loss(e_theta.view(-1, point_dim), e_rand.view(-1, point_dim), reduction='mean')
+
+        if pointnet is not None and guidance_weight > 0:
+            classification = pointnet(x_diffused)
+            if isinstance(classification, tuple):
+                logits = classification[0]
+            else:
+                logits = classification
+
+            confidence, _ = logits.max(dim=1, keepdim=True)
+            guidance_loss = F.mse_loss(x_diffused, x_diffused * confidence.unsqueeze(-1), reduction='mean')
+            loss = loss + guidance_weight * guidance_loss
+
         return loss
 
-    def sample(self, num_points, context, point_dim=3, flexibility=0.0, ret_traj=False):
+    def sample(self, num_points, context, pointnet=None, guidance_weight=0.5, point_dim=3, flexibility=0.0, ret_traj=False):
+        """
+        Generate samples from the diffusion model.
+
+        Args:
+            num_points: Number of points in each point cloud.
+            context: Shape latent (B, F).
+            pointnet: PointNet classifier for guidance.
+            guidance_weight: Weight for the guidance influence.
+            point_dim: Dimensionality of points (default is 3).
+            flexibility: Flexibility parameter for the diffusion process.
+            ret_traj: Whether to return the trajectory of intermediate steps.
+
+        Returns:
+            The final sampled point clouds or the trajectory of intermediate steps if ret_traj is True.
+        """
         batch_size = context.size(0)
         x_T = torch.randn([batch_size, num_points, point_dim]).to(context.device)
         traj = {self.var_sched.num_steps: x_T}
@@ -132,16 +160,28 @@ class DiffusionPoint(Module):
             c1 = (1 - alpha) / torch.sqrt(1 - alpha_bar)
 
             x_t = traj[t]
-            beta = self.var_sched.betas[[t]*batch_size]
+            beta = self.var_sched.betas[[t] * batch_size]
             e_theta = self.net(x_t, beta=beta, context=context)
             x_next = c0 * (x_t - c1 * e_theta) + sigma * z
-            traj[t-1] = x_next.detach()     # Stop gradient and save trajectory.
-            traj[t] = traj[t].cpu()         # Move previous output to CPU memory.
+
+            if pointnet is not None and guidance_weight > 0:
+                classification = pointnet(x_next)
+                if isinstance(classification, tuple):
+                    logits = classification[0]
+                else:
+                    logits = classification
+                confidence, _ = logits.max(dim=1, keepdim=True)
+                x_next = (1 - guidance_weight) * x_next + guidance_weight * x_next * confidence.unsqueeze(-1)
+
+            traj[t - 1] = x_next.detach()
+            traj[t] = traj[t].cpu()
             if not ret_traj:
                 del traj[t]
-        
+
         if ret_traj:
             return traj
         else:
             return traj[0]
-
+    
+    def forward(self, x, context, t=None, pointnet=None, guidance_weight=1):
+        return self.get_loss(x, context, t, pointnet, guidance_weight)
